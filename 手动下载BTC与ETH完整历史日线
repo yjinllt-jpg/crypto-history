@@ -1,0 +1,304 @@
+name: 手动下载BTC与ETH完整历史日线
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "起始日期 YYYY-MM-DD（默认2017-08-01）"
+        required: false
+        default: "2017-08-01"
+        type: string
+      end_date:
+        description: "结束日期 YYYY-MM-DD（留空表示UTC昨天）"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    name: 从币安公开档案生成CSV
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 下载并整理BTC、ETH历史数据
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          #!/usr/bin/env python3
+          """Download BTCUSDT and ETHUSDT spot daily OHLCV from Binance Public Data.
+          
+          No API key or third-party Python dependencies. Does not manufacture missing data.
+          """
+          from __future__ import annotations
+          
+          import csv
+          import io
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          import zipfile
+          from collections import deque
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          
+          BASE_URL = "https://data.binance.vision/data/spot"
+          SYMBOLS = ("BTCUSDT", "ETHUSDT")
+          FIRST_DATE = date(2017, 8, 1)
+          OUTPUT = Path("output")
+          HTTP_TIMEOUT = 18
+          MAX_RETRIES = 3
+          RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
+          COLUMNS = [
+              "Date_UTC", "Open_USDT", "High_USDT", "Low_USDT", "Close_USDT",
+              "Volume_Base", "Volume_USDT", "Trades", "MA10", "MA20", "MA60", "MA100",
+          ]
+          
+          
+          def get_dates():
+              start = date.fromisoformat(os.environ.get("START_DATE", "2017-08-01"))
+              end_value = os.environ.get("END_DATE", "").strip()
+              # Only closed UTC candles. Today's unfinished candle must not be included.
+              yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days=1)
+              end = date.fromisoformat(end_value) if end_value else yesterday_utc
+              if start < FIRST_DATE:
+                  raise ValueError("起始日期不得早于2017-08-01（此程序下载币安BTC/ETH USDT现货）。")
+              if end > yesterday_utc:
+                  raise ValueError("结束日期不得晚于UTC昨天，今天的日线尚未收盘。")
+              if end < start:
+                  raise ValueError("结束日期不能早于开始日期。")
+              return start, end
+          
+          
+          def iter_months(start, end):
+              year, month = start.year, start.month
+              while (year, month) <= (end.year, end.month):
+                  yield year, month
+                  month += 1
+                  if month == 13:
+                      year, month = year + 1, 1
+          
+          
+          def daterange(start, end):
+              day = start
+              while day <= end:
+                  yield day
+                  day += timedelta(days=1)
+          
+          
+          def read_url(url, issues):
+              # A missing monthly ZIP is normal for an unfinished/unpublished month.
+              for retry in range(MAX_RETRIES):
+                  try:
+                      request = urllib.request.Request(url, headers={"User-Agent": "CryptoHistoricalDownloader/1.0"})
+                      with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                          data = response.read()
+                      if not data.startswith(b"PK"):
+                          raise ValueError("服务器返回的内容并非ZIP压缩包")
+                      return data
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          return None
+                      if exc.code not in RETRYABLE or retry + 1 == MAX_RETRIES:
+                          issues.append({"url": url, "problem": f"HTTP {exc.code}"})
+                          return None
+                  except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                      if retry + 1 == MAX_RETRIES:
+                          issues.append({"url": url, "problem": str(exc)[:200]})
+                          return None
+                  time.sleep(1.5 * (retry + 1))
+              return None
+          
+          
+          def parse_zip(blob, url, issues):
+              rows = []
+              try:
+                  with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+                      for name in archive.namelist():
+                          if not name.lower().endswith(".csv"):
+                              continue
+                          with archive.open(name) as binary:
+                              text = io.TextIOWrapper(binary, encoding="utf-8-sig", newline="")
+                              for lineno, cols in enumerate(csv.reader(text), 1):
+                                  if not cols or cols[0].strip().lower() in ("open time", "open_time"):
+                                      continue
+                                  try:
+                                      if len(cols) < 9:
+                                          raise ValueError("少于9列")
+                                      timestamp = int(cols[0])
+                                      # Binance SPOT switches from milliseconds to microseconds on 2025-01-01.
+                                      divisor = 1_000_000 if timestamp >= 10**15 else 1_000
+                                      utc = datetime.fromtimestamp(timestamp / divisor, tz=timezone.utc)
+                                      if utc.hour != 0 or utc.minute != 0 or utc.second != 0:
+                                          raise ValueError("日线开盘时间不是UTC 00:00")
+                                      day = utc.date()
+                                      o, h, lo, c = map(float, cols[1:5])
+                                      vol = float(cols[5])
+                                      qvol = float(cols[7])
+                                      trades = int(cols[8])
+                                      if not (0 < lo <= min(o, c) <= max(o, c) <= h and vol >= 0 and qvol >= 0 and trades >= 0):
+                                          raise ValueError("OHLCV数值异常")
+                                      rows.append((day, cols[1], cols[2], cols[3], cols[4], cols[5], cols[7], str(trades)))
+                                  except (ValueError, OverflowError, IndexError) as exc:
+                                      issues.append({"url": url, "line": lineno, "problem": str(exc)})
+              except (zipfile.BadZipFile, OSError, UnicodeDecodeError) as exc:
+                  issues.append({"url": url, "problem": f"ZIP解析失败：{exc}"})
+              return rows
+          
+          
+          def missing_ranges(missing_dates):
+              if not missing_dates:
+                  return []
+              result = []
+              left = right = missing_dates[0]
+              for day in missing_dates[1:]:
+                  if (day - right).days == 1:
+                      right = day
+                  else:
+                      result.append({"from": left.isoformat(), "to": right.isoformat(), "days": (right - left).days + 1})
+                      left = right = day
+              result.append({"from": left.isoformat(), "to": right.isoformat(), "days": (right - left).days + 1})
+              return result
+          
+          
+          def save_symbol(symbol, start, end):
+              print(f"\n=== {symbol}: {start} ... {end} (UTC) ===", flush=True)
+              issues = []
+              observations = {}
+              downloaded_monthly = 0
+              downloaded_daily = 0
+              for year, month in iter_months(start, end):
+                  first = max(date(year, month, 1), start)
+                  if month == 12:
+                      month_end = date(year + 1, 1, 1) - timedelta(days=1)
+                  else:
+                      month_end = date(year, month + 1, 1) - timedelta(days=1)
+                  last = min(month_end, end)
+                  if first > last:
+                      continue
+                  ym = f"{year:04d}-{month:02d}"
+                  url = f"{BASE_URL}/monthly/klines/{symbol}/1d/{symbol}-1d-{ym}.zip"
+                  blob = read_url(url, issues)
+                  month_rows = parse_zip(blob, url, issues) if blob else []
+                  if month_rows:
+                      downloaded_monthly += 1
+                      print(f"  月包 {ym}: {len(month_rows)} 行", flush=True)
+                  else:
+                      # Daily fallback handles the current month and unpublished monthly archives.
+                      print(f"  月包 {ym} 不可用，逐日补取", flush=True)
+                      for day in daterange(first, last):
+                          ds = day.isoformat()
+                          daily_url = f"{BASE_URL}/daily/klines/{symbol}/1d/{symbol}-1d-{ds}.zip"
+                          daily_blob = read_url(daily_url, issues)
+                          if daily_blob:
+                              downloaded_daily += 1
+                              month_rows.extend(parse_zip(daily_blob, daily_url, issues))
+                  for row in month_rows:
+                      day = row[0]
+                      if start <= day <= end:
+                          if day in observations and row != observations[day]:
+                              issues.append({"day": day.isoformat(), "problem": "重复日期且数据不一致"})
+                          else:
+                              observations[day] = row
+          
+              OUTPUT.mkdir(parents=True, exist_ok=True)
+              dates = sorted(observations)
+              file = OUTPUT / f"{symbol}_1d.csv"
+              ma_periods = (10, 20, 60, 100)
+              with file.open("w", encoding="utf-8-sig", newline="") as stream:
+                  writer = csv.writer(stream)
+                  writer.writerow(COLUMNS)
+                  close_history = deque(maxlen=100)
+                  prev = None
+                  for day in dates:
+                      row = observations[day]
+                      # Reset rolling MA across missing calendar days rather than silently skipping holes.
+                      if prev is not None and (day - prev).days != 1:
+                          close_history.clear()
+                      close_history.append(float(row[4]))
+                      ma = [f"{sum(list(close_history)[-n:]) / n:.8f}" if len(close_history) >= n else ""
+                            for n in ma_periods]
+                      writer.writerow([day.isoformat(), *row[1:], *ma])
+                      prev = day
+          
+              first_data = dates[0] if dates else None
+              last_data = dates[-1] if dates else None
+              # The initial non-trading days before each token was first listed are not called missing.
+              # Binance historical files may predate the requested period only within monthly archive.
+              missing = [d for d in daterange(max(start, first_data), end) if d not in observations] if dates else []
+              summary = {
+                  "symbol": symbol,
+                  "source": "Binance spot BTCUSDT/ETHUSDT, 1d, UTC",
+                  "requested_start": start.isoformat(),
+                  "requested_end": end.isoformat(),
+                  "first_observed_date": first_data.isoformat() if first_data else None,
+                  "last_observed_date": last_data.isoformat() if last_data else None,
+                  "row_count": len(dates),
+                  "monthly_zip_count": downloaded_monthly,
+                  "daily_zip_count": downloaded_daily,
+                  "missing_days_since_first_observation": len(missing),
+                  "missing_date_ranges": missing_ranges(missing),
+                  "download_or_parse_issues": issues,
+                  "file": file.name,
+              }
+              print(f"  生成 {file}: {len(dates)} 行；已发现的缺失日期 {len(missing)} 天；请求/解析问题 {len(issues)} 项", flush=True)
+              return summary
+          
+          
+          def main():
+              start, end = get_dates()
+              results = [save_symbol(symbol, start, end) for symbol in SYMBOLS]
+              report = {
+                  "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "important": "仅使用Binance实际历史记录；不对缺失日期插值或补造数据。日K线按UTC划分。",
+                  "results": results,
+              }
+              (OUTPUT / "data_quality_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+              with (OUTPUT / "data_quality_summary.md").open("w", encoding="utf-8") as stream:
+                  stream.write("# BTC / ETH 数据下载与质量报告\n\n")
+                  stream.write(f"下载区间：{start} 至 {end}（UTC，含首尾）\n\n")
+                  stream.write("| 币种 | 行数 | 实际首日 | 实际末日 | 缺失天数 | 请求/解析问题 |\n")
+                  stream.write("|---|---:|---|---|---:|---:|\n")
+                  for r in results:
+                      stream.write(f"| {r['symbol']} | {r['row_count']} | {r['first_observed_date']} | "
+                                   f"{r['last_observed_date']} | {r['missing_days_since_first_observation']} | "
+                                   f"{len(r['download_or_parse_issues'])} |\n")
+                  stream.write("\n## 缺失日期区间（未补造数据）\n\n")
+                  for r in results:
+                      stream.write(f"### {r['symbol']}\n")
+                      for part in r['missing_date_ranges'][:100]:
+                          stream.write(f"- {part['from']} 至 {part['to']}（{part['days']}天）\n")
+                      if len(r['missing_date_ranges']) > 100:
+                          stream.write("- 其余缺失区间详见 JSON 报告\n")
+                      if not r['missing_date_ranges']:
+                          stream.write("- 首条有效记录之后没有发现日期缺口\n")
+                  stream.write("\n注意：最早有效记录之前的日期不计为缺口，但不代表有该交易对数据。MA均线缺少足够连续日线时为空。\n")
+              # Failure still leaves files & report to download, via upload-artifact if: always().
+              if any(not r["row_count"] for r in results):
+                  print("ERROR: 至少有一个交易对完全没有下载到数据，检查下载日志。", file=sys.stderr)
+                  return 1
+              if any(r["missing_days_since_first_observation"] or r["download_or_parse_issues"] for r in results):
+                  print("WARNING: 存在缺失日期或下载问题，回测前请查看data_quality_report.json。", file=sys.stderr)
+              return 0
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYCODE
+
+      - name: 上传CSV和数据质量报告供下载
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BTC-ETH-日线数据与质量报告
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
