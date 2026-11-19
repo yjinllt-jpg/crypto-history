@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-11-19T16:20:19.829429+00:00",
+  "important": "仅使用Binance实际历史记录；不对缺失日期插值或补造数据。日K线按UTC划分。",
+  "results": [
+    {
+      "symbol": "BTCUSDT",
+      "source": "Binance spot BTCUSDT/ETHUSDT, 1d, UTC",
+      "requested_start": "2017-08-01",
+      "requested_end": "2026-11-18",
+      "first_observed_date": "2017-08-17",
+      "last_observed_date": "2026-11-18",
+      "row_count": 3381,
+      "monthly_zip_count": 111,
+      "daily_zip_count": 18,
+      "missing_days_since_first_observation": 0,
+      "missing_date_ranges": [],
+      "download_or_parse_issues": [],
+      "file": "BTCUSDT_1d.csv"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "source": "Binance spot BTCUSDT/ETHUSDT, 1d, UTC",
+      "requested_start": "2017-08-01",
+      "requested_end": "2026-11-18",
+      "first_observed_date": "2017-08-17",
+      "last_observed_date": "2026-11-18",
+      "row_count": 3381,
+      "monthly_zip_count": 111,
+      "daily_zip_count": 18,
+      "missing_days_since_first_observation": 0,
+      "missing_date_ranges": [],
+      "download_or_parse_issues": [],
+      "file": "ETHUSDT_1d.csv"
+    }
+  ]
+}
