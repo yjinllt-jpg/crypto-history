@@ -1,6 +1,8 @@
-name: 手动下载BTC与ETH完整历史日线
+name: 自动更新 BTC与ETH 日线（可手动运行）
 
 on:
+  schedule:
+    - cron: '17 15 * * *'
   workflow_dispatch:
     inputs:
       start_date:
@@ -15,7 +17,12 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
+
+# 两个工作流共享同一仓库，避免同时提交到main而互相冲突
+concurrency:
+  group: crypto-data-update
+  cancel-in-progress: false
 
 jobs:
   download:
@@ -23,6 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: 检出仓库（用于保存最新CSV）
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - name: 下载并整理BTC、ETH历史数据
         env:
           START_DATE: ${{ inputs.start_date }}
@@ -64,7 +76,7 @@ jobs:
           
           
           def get_dates():
-              start = date.fromisoformat(os.environ.get("START_DATE", "2017-08-01"))
+              start = date.fromisoformat(os.environ.get("START_DATE") or "2017-08-01")
               end_value = os.environ.get("END_DATE", "").strip()
               # Only closed UTC candles. Today's unfinished candle must not be included.
               yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days=1)
@@ -302,3 +314,68 @@ jobs:
           path: output/
           if-no-files-found: warn
           retention-days: 30
+
+      # 只有标准的“完整历史下载”才覆盖data。自定义日期范围只在Artifacts里提供。
+      - name: 完整性检查合格后写入data并提交到main
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.start_date == '' || inputs.start_date == '2017-08-01') && inputs.end_date == '') }}
+        shell: bash
+        run: |
+          python3 - <<'PYSAVE'
+          import csv
+          import json
+          import shutil
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          expected = {"BTCUSDT": "2017-08-17","ETHUSDT": "2017-08-17"}
+          report = json.loads(Path("output/data_quality_report.json").read_text(encoding="utf-8"))
+          results = {r["symbol"]: r for r in report["results"]}
+          if set(results) != set(expected):
+              raise SystemExit(f"币种不一致，停止覆盖仓库数据: {list(results)}")
+          data_dir = Path("data")
+          # 先校验所有币种，全部通过后才写回data（不产生半套更新）
+          planned = []
+          for symbol, first_day in expected.items():
+              r = results[symbol]
+              src = Path("output") / f"{symbol}_1d.csv"
+              if not src.is_file() or not r["row_count"]:
+                  raise SystemExit(f"{symbol}: CSV为空或不存在，停止提交")
+              if r["first_observed_date"] != first_day:
+                  raise SystemExit(f"{symbol}: 历史起点异常 {r['first_observed_date']}，预期 {first_day}")
+              if r["last_observed_date"] != r["requested_end"]:
+                  raise SystemExit(f"{symbol}: 尚未下载到截至UTC昨天的日线，保持旧数据不变")
+              if r["missing_days_since_first_observation"] or r["download_or_parse_issues"]:
+                  raise SystemExit(f"{symbol}: 存在缺失或下载/解析异常，不覆盖旧数据")
+              with src.open("r", encoding="utf-8-sig", newline="") as f:
+                  records = list(csv.DictReader(f))
+              if len(records) != r["row_count"]:
+                  raise SystemExit(f"{symbol}: CSV行数与报告不一致")
+              days = [date.fromisoformat(row["Date_UTC"]) for row in records]
+              if not days or days[0].isoformat() != first_day or days[-1].isoformat() != r["requested_end"]:
+                  raise SystemExit(f"{symbol}: CSV日期起止异常")
+              if any((b - a).days != 1 for a,b in zip(days, days[1:])):
+                  raise SystemExit(f"{symbol}: CSV存在重复日期或缺失日期")
+              dst = data_dir / src.name
+              if dst.is_file():
+                  with dst.open("r", encoding="utf-8-sig", newline="") as f:
+                      previous = list(csv.DictReader(f))
+                  if previous and previous[-1]["Date_UTC"] > days[-1].isoformat():
+                      raise SystemExit(f"{symbol}: 新数据日期早于旧数据，拒绝回退")
+              planned.append((src, dst))
+              print(f"质量检查通过：{symbol} {len(days)}天，截至{days[-1]}")
+          data_dir.mkdir(exist_ok=True)
+          for src, dst in planned:
+              shutil.copyfile(src, dst)
+          shutil.copyfile("output/data_quality_report.json", data_dir / "BTC_ETH_data_quality_report.json")
+          shutil.copyfile("output/data_quality_summary.md", data_dir / "BTC_ETH_data_quality_summary.md")
+          PYSAVE
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- data/BTCUSDT_1d.csv data/ETHUSDT_1d.csv data/BTC_ETH_data_quality_report.json data/BTC_ETH_data_quality_summary.md
+          if git diff --cached --quiet; then
+            echo "CSV及报告未变化，无需提交。"
+          else
+            git commit -m "data: update BTCUSDT ETHUSDT UTC daily OHLCV"
+            git push origin HEAD:main
+          fi
